@@ -1,0 +1,9 @@
+node_modules/
+output*.json
+output*.ndjson
+screenshots/
+.tmp/
+.env
+.env.local
+outputs/
+package-lock.json

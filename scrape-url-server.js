@@ -149,7 +149,23 @@ function fireAndForgetDiscovery({ companyId = null, platforms = null, headful = 
 
   // Spawn discovery scraper for each platform
   const jobs = [];
+  // Track completion: without this the job stayed "running" forever, and the dedupe check
+  // (findRunningJobByKey) then swallowed every later discovery request for the same company.
+  let remaining = platformList.length;
+  let anyFailed = false;
+  const markFinished = (failed) => {
+    if (failed) anyFailed = true;
+    remaining -= 1;
+    if (remaining > 0) return;
+    const job = activeJobs.get(jobId);
+    if (job) {
+      job.status = anyFailed ? 'failed' : 'done';
+      job.finishedAt = new Date().toISOString();
+    }
+  };
   for (const platform of platformList) {
+    let finished = false;
+    const finishOnce = (failed) => { if (finished) return; finished = true; markFinished(failed); };
     const scriptPath = `src/discovery/scrape-${platform}-discovery.js`;
     const args = [scriptPath];
 
@@ -168,6 +184,7 @@ function fireAndForgetDiscovery({ companyId = null, platforms = null, headful = 
 
     cp.on('error', (err) => {
       console.error(`[${jobId}] ❌ ${platform} discovery process error: ${err.message}`);
+      finishOnce(true);
     });
 
     cp.on('close', (code) => {
@@ -176,6 +193,7 @@ function fireAndForgetDiscovery({ companyId = null, platforms = null, headful = 
       } else {
         console.error(`[${jobId}] ❌ ${platform} discovery exited with code ${code}`);
       }
+      finishOnce(code !== 0);
     });
   }
 

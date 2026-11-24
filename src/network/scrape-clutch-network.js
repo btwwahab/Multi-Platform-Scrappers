@@ -1,6 +1,8 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import os from 'node:os';
+import http from 'node:http';
+import 'dotenv/config';
 import puppeteer from 'puppeteer-core';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -37,6 +39,57 @@ function nextProxy() {
 	return { host: entry[0], port: entry[1], username: entry[2], password: entry[3] };
 }
 
+// ── Proxy health check ─────────────────────────────────────────────────────────
+// Some static proxies expire / lose auth (HTTP 407). Handing one to Chrome only produces a useless
+// "This page isn't working" error, so verify a proxy answers before using it and skip dead ones.
+const _deadProxies = new Set();
+
+function proxyIsAlive(proxy, timeoutMs = 8000) {
+	return new Promise((resolve) => {
+		const auth = Buffer.from(`${proxy.username}:${proxy.password}`).toString('base64');
+		const req = http.request({
+			host: proxy.host,
+			port: Number(proxy.port),
+			method: 'GET',
+			path: 'http://ipv4.webshare.io/',
+			headers: { Host: 'ipv4.webshare.io', 'Proxy-Authorization': `Basic ${auth}` },
+		}, (res) => {
+			res.resume();
+			resolve(res.statusCode >= 200 && res.statusCode < 300);
+		});
+		req.setTimeout(timeoutMs, () => { req.destroy(); resolve(false); });
+		req.on('error', () => resolve(false));
+		req.end();
+	});
+}
+
+// Rotating Webshare gateway (PROXY_* vars) — used only if every static proxy in the pool is dead.
+function rotatingGatewayProxy() {
+	const host = process.env.PROXY_HOST;
+	const prefix = process.env.PROXY_USER_PREFIX;
+	const password = process.env.PROXY_PASSWORD;
+	if (!host || !prefix || !password) return null;
+	return { host, port: String(process.env.PROXY_PORT || 80), username: `${prefix}-rotate`, password };
+}
+
+async function pickHealthyProxy() {
+	if (!USE_PROXY || !PROXY_POOL?.length) return null;
+	for (let i = 0; i < PROXY_POOL.length; i++) {
+		const p = nextProxy();
+		const key = `${p.host}:${p.port}`;
+		if (_deadProxies.has(key)) continue;
+		if (await proxyIsAlive(p)) return p;
+		_deadProxies.add(key);
+		console.warn(`[proxy] ${key} is dead (auth/connect failed) — skipping`);
+	}
+	const gw = rotatingGatewayProxy();
+	if (gw && await proxyIsAlive(gw)) {
+		console.warn('[proxy] All static proxies are dead — falling back to the rotating gateway');
+		return gw;
+	}
+	throw new Error('No working proxy available (all static proxies failed their health check)');
+}
+
 // ── Tiny helpers ──────────────────────────────────────────────────────────────
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const now = () => new Date().toISOString();
@@ -44,6 +97,16 @@ const norm = (s) => String(s || '').replace(/\s+/g, ' ').trim();
 
 async function ensureDir(p) {
 	await fs.mkdir(p, { recursive: true });
+}
+
+// Best-effort debug screenshot. (This helper was referenced by the error handler but never defined, so any
+// scraper error crashed the process with "ReferenceError: takeScreenshot is not defined".)
+async function takeScreenshot(page, label) {
+	try {
+		const dir = path.join(os.tmpdir(), 'va-scrapper-screenshots');
+		await ensureDir(dir);
+		await page.screenshot({ path: path.join(dir, `clutch-${label}-${Date.now()}.png`) });
+	} catch { /* never let a screenshot failure mask the real error */ }
 }
 
 async function readJson(f) {
@@ -176,7 +239,7 @@ function parseArgs(argv) {
 
 // ── Browser ───────────────────────────────────────────────────────────────────
 async function launchBrowser({ headful, blockAssets, userDataDir }) {
-	const proxy = nextProxy();
+	const proxy = await pickHealthyProxy();
 	const userAgents = [
 		'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
 		'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
@@ -356,12 +419,19 @@ async function dismissCookieBanner(page) {
 async function detectBlock(page) {
 	try {
 		return await page.evaluate(() => {
-			const t = (document.body?.innerText || '').toLowerCase();
+			const body = document.body?.innerText || '';
+			const t = body.toLowerCase();
 			const title = (document.title || '').toLowerCase();
-			const blocked =
-				/captcha|verify you are human|access denied|forbidden|blocked|cloudflare|security check|robot check/i.test(t) ||
-				/attention required|just a moment|cloudflare/i.test(title);
-			return { blocked, title: document.title, snippet: (document.body?.innerText || '').slice(0, 300) };
+			// Chrome's own error page (dead proxy, tunnel failure, 4xx/5xx with empty body ...)
+			const chromeError = /this page isn.t working|this site can.t be reached|err_[a-z_]+|proxy server/i.test(`${title}\n${t.slice(0, 600)}`)
+				&& body.length < 1500;
+			// Real profile pages are long and contain review text that can legitimately include words like
+			// "blocked"/"forbidden"; only scan the *start* of short / challenge-like pages.
+			const looksLikeRealPage = body.length > 3000 && !!document.querySelector('h1');
+			const blocked = chromeError || (!looksLikeRealPage && (
+				/captcha|verify you are human|access denied|forbidden|blocked|cloudflare|security check|robot check/i.test(t.slice(0, 1500)) ||
+				/attention required|just a moment|cloudflare/i.test(title)));
+			return { blocked, chromeError, title: document.title, snippet: body.slice(0, 300) };
 		});
 	} catch {
 		return { blocked: false, title: null, snippet: null };
@@ -773,7 +843,7 @@ async function main() {
 
 	let company = prevCompany;
 	let lastError = null;
-	const maxProxyAttempts = 2;
+	const maxProxyAttempts = 4;
 
 	for (let proxyAttempt = 1; proxyAttempt <= maxProxyAttempts; proxyAttempt++) {
 		let browser;
@@ -801,7 +871,20 @@ async function main() {
 		if (isVerificationBlock(block)) {
 			const err = new Error(`Blocked on page load: ${block.title} — ${block.snippet}`);
 			err.retryWithNextProxy = true;
+			err.chromeError = !!block.chromeError;
 			throw err;
+		}
+
+		// A wrong/removed profile URL is not fixable by switching IP — fail fast instead of retrying 4×.
+		const notFound = await page.evaluate(() => {
+			const title = document.title || '';
+			const h1 = (document.querySelector('h1')?.textContent || '').trim();
+			return /^404\b|page not found|not found/i.test(title) || /^404$/.test(h1) || /^page not found/i.test(h1);
+		}).catch(() => false);
+		if (notFound) {
+			const e = new Error(`Clutch profile not found (404): ${baseUrl}`);
+			e.noRetry = true;
+			throw e;
 		}
 
 		// ── Step 2: Extract company info ──────────────────────────────────────────
@@ -974,13 +1057,16 @@ async function main() {
 
 		} catch (err) {
 			const message = String(err?.message || err || '');
-			const retryable = err?.retryWithNextProxy || /blocked on page load|just a moment|cloudflare|performing security verification|security verification|challenge|verify|check/i.test(message);
+			// Anything that can be cured by switching IP: Cloudflare challenge, dead/slow proxy, Chrome error page,
+			// missing nonce (page didn't render properly through that IP), navigation/socket failures.
+			const proxyProblem = /no working proxy|net::|ERR_|proxy|tunnel|ECONN|ETIMEDOUT|socket|isn.t working|can.t be reached|detached frame|target closed|session closed|protocol error/i.test(message);
+			const retryable = !err?.noRetry && (err?.retryWithNextProxy || proxyProblem || /blocked on page load|just a moment|cloudflare|performing security verification|security verification|challenge|verify|check|nonce|timeout|timed out|navigation/i.test(message));
 
 			if (retryable && proxyAttempt < maxProxyAttempts) {
 				console.warn(`\n[proxy] ${message}; retrying with next IP (${proxyAttempt}/${maxProxyAttempts})...`);
 				lastError = err;
-				// Longer delay for Cloudflare to cool down IP
-				const delay = 15000 + Math.floor(Math.random() * 10000);
+				// Cloudflare needs a long cool-down for the IP; a dead proxy / error page doesn't.
+				const delay = proxyProblem || err?.chromeError ? 2000 : 15000 + Math.floor(Math.random() * 10000);
 				console.log(`[proxy] Waiting ${delay}ms before retry...`);
 				await sleep(delay);
 				continue;

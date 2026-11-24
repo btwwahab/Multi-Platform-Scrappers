@@ -273,9 +273,13 @@ async function clickConsent(page) {
   }
 }
 
+// GoodFirms rebuilt its profile pages (Next.js, "cp2-*" classes). The legacy selector is kept as a
+// fallback so an older cached/layout variant still works.
+const REVIEW_CARD_SELECTOR = 'article.cp2-review, #reviews_list article.profile-review, article.profile-review';
+
 async function waitForReviews(page) {
   try {
-    await page.waitForSelector('#reviews_list article.profile-review', { timeout: 20_000 });
+    await page.waitForSelector(REVIEW_CARD_SELECTOR, { timeout: 20_000 });
     return true;
   } catch {
     return false;
@@ -284,13 +288,16 @@ async function waitForReviews(page) {
 
 async function detectBlock(page) {
   try {
-    return await page.evaluate(() => {
+    return await page.evaluate((cardSelector) => {
       const title = String(document.title || '');
       const body = String(document.body?.innerText || '');
-      const text = `${title}\n${body}`.toLowerCase();
-      const blocked = /captcha|verify you are human|access denied|forbidden|blocked|cloudflare|security check|robot check|just a moment|attention required|checking your browser|performing security/i.test(text);
+      // A real profile page has review cards; never treat it as blocked just because a review
+      // happens to contain a word like "blocked" or "forbidden".
+      const hasContent = !!document.querySelector(cardSelector) || !!document.querySelector('h1') && body.length > 2500;
+      const text = `${title}\n${body.slice(0, 1500)}`.toLowerCase();
+      const blocked = !hasContent && /captcha|verify you are human|access denied|forbidden|blocked|cloudflare|security check|robot check|just a moment|attention required|checking your browser|performing security/i.test(text);
       return { blocked, title, snippet: body.slice(0, 300) };
-    });
+    }, REVIEW_CARD_SELECTOR);
   } catch {
     return { blocked: false, title: null, snippet: null };
   }
@@ -359,16 +366,35 @@ async function extractCompanyAndAnalytics(page) {
       .map((el) => n(el.textContent))
       .filter(Boolean);
 
+    // New layout: schema.org aggregateRating in JSON-LD is the most stable source.
+    let ld = null;
+    const findAgg = (node) => {
+      if (!node || typeof node !== 'object') return null;
+      if (node.aggregateRating && typeof node.aggregateRating === 'object') return node.aggregateRating;
+      for (const v of Array.isArray(node) ? node : Object.values(node)) {
+        const hit = findAgg(v);
+        if (hit) return hit;
+      }
+      return null;
+    };
+    for (const s of document.querySelectorAll('script[type="application/ld+json"]')) {
+      try { ld = findAgg(JSON.parse(s.textContent || 'null')); } catch { /* ignore */ }
+      if (ld) break;
+    }
+    const heroRating = num(document.querySelector('.cp2-rating-big-num, .cp2-hero-ratingnum')?.textContent);
+    const heroCount = num(document.querySelector('.cp2-rating-big-count')?.textContent);
+    const metricRating = (() => {
+      const raw = metrics['overall rating'];
+      const value = raw ? Number.parseFloat(raw) : null;
+      return Number.isFinite(value) ? value : null;
+    })();
+
     return {
       company: {
         name: companyName,
         profileUrl: location.origin + location.pathname,
-        totalReviews: num(metrics['total reviews']) ?? null,
-        overallRating: (() => {
-          const raw = metrics['overall rating'];
-          const value = raw ? Number.parseFloat(raw) : null;
-          return Number.isFinite(value) ? value : null;
-        })(),
+        totalReviews: num(metrics['total reviews']) ?? num(ld?.reviewCount ?? ld?.ratingCount) ?? heroCount ?? null,
+        overallRating: metricRating ?? num(ld?.ratingValue) ?? heroRating ?? null,
         recentReviews: num(metrics['recent reviews']) ?? null,
       },
       analytics: {
@@ -401,6 +427,75 @@ async function extractPageReviews(page, htmlSnippet = null) {
     };
 
     const out = [];
+
+    // ── New layout (Next.js "cp2-*" markup) ─────────────────────────────────────
+    for (const card of root.querySelectorAll('article.cp2-review')) {
+      const reviewId = card.id ? card.id.replace(/^review-/, '') : null;
+
+      // Name node contains: "<name>, <role>" + a "Verified Review" badge we must drop.
+      const nameEl = card.querySelector('.cp2-review-name');
+      let nameFull = '';
+      if (nameEl) {
+        const clone = nameEl.cloneNode(true);
+        clone.querySelectorAll('.cp2-review-verified').forEach((e) => e.remove());
+        nameFull = n(clone.textContent);
+      }
+      const avatarAlt = n(card.querySelector('img.cp2-review-avatar')?.getAttribute('alt'));
+      let reviewerName = null;
+      let reviewerRole = null;
+      if (nameFull) {
+        if (avatarAlt && nameFull.startsWith(avatarAlt)) {
+          reviewerName = avatarAlt;
+          reviewerRole = n(nameFull.slice(avatarAlt.length).replace(/^\s*,\s*/, '')) || null;
+        } else {
+          const m = nameFull.match(/^([^,]+),\s*(.+)$/);
+          reviewerName = n(m ? m[1] : nameFull) || null;
+          reviewerRole = m ? n(m[2]) || null : null;
+        }
+      }
+
+      const verified = !!card.querySelector('.cp2-review-verified');
+      const reviewDate = n(card.querySelector('.cp2-review-date')?.textContent).replace(/^Posted on\s*/i, '') || null;
+      const title = n(card.querySelector('.cp2-review-quote')?.textContent).replace(/^[“"']+|[”"']+$/g, '').trim() || null;
+      const summary = n(card.querySelector('.cp2-review-text')?.textContent) || null;
+
+      const ratingBreakdown = {};
+      const overall = parseFloat(n(card.querySelector('.cp2-review-overall-val')?.textContent));
+      if (Number.isFinite(overall)) ratingBreakdown['Overall Rating'] = overall;
+      for (const m of card.querySelectorAll('.cp2-review-metric')) {
+        const label = n(m.querySelector(':scope > span:first-child')?.textContent) || null;
+        const val = parseFloat(n(m.querySelector('.cp2-review-metric-val')?.textContent));
+        if (label && Number.isFinite(val)) ratingBreakdown[label] = val;
+      }
+
+      const projectDetails = [];
+      const projectDetailsMap = {};
+      for (const chip of card.querySelectorAll('.cp2-review-tags [class*="cp2-chip"]')) {
+        const value = n(chip.textContent);
+        const label = n(chip.getAttribute('title')) || 'Category';
+        if (!value) continue;
+        projectDetails.push({ label, value });
+        (projectDetailsMap[label] ||= []).push(value);
+      }
+
+      if (!reviewId && !summary && !title) continue;
+      out.push({
+        reviewId,
+        reviewUrl: reviewId ? `${location.origin}${location.pathname}#review-${reviewId}` : null,
+        title,
+        summary,
+        reviewer: { name: reviewerName, role: reviewerRole, verified },
+        date: reviewDate,
+        ratingBreakdown,
+        projectDetails,
+        projectDetailsMap,
+        projectInformation: [],
+        projectInformationMap: {},
+        scrapedAt: new Date().toISOString(),
+      });
+    }
+
+    // ── Legacy layout (kept as fallback) ────────────────────────────────────────
     for (const card of root.querySelectorAll('#reviews_list article.profile-review, article.profile-review')) {
       const reviewId = card.id ? card.id.replace(/^review-/, '') : null;
       const title = n(card.querySelector('.review-title')?.textContent) || null;
@@ -754,6 +849,17 @@ async function main() {
 
   await writeAtomic(outPath, output);
   console.log(`✅ Saved ${reviews.length} reviews to ${outPath}`);
+
+  // Never fail silently: the profile says it has reviews but we parsed none → selectors are stale
+  // (GoodFirms changed its layout again) or the page was a soft block. Exit non-zero so the
+  // orchestrator marks the job FAILED instead of treating it as "0 reviews, all good".
+  const expected = Number(totalReviews) || 0;
+  if (reviews.length === 0 && expected > 0) {
+    console.error(`❌ Profile reports ${expected} reviews but 0 were parsed (stopReason=${stopReason}). GoodFirms layout likely changed.`);
+    process.exitCode = 1;
+  } else if (expected > 0 && reviews.length < Math.min(expected, 15) && stopReason !== 'max_pages_reached') {
+    console.warn(`⚠️  Parsed ${reviews.length} of ${expected} reviews (stopReason=${stopReason}).`);
+  }
 }
 
 main().catch((err) => {

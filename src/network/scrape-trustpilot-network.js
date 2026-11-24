@@ -896,12 +896,15 @@ async function main() {
 			});
 
 			console.log(`\n🏁 Finished: ${reviews.length}  done=${done}`);
+			// An earlier attempt (blocked IP, page-load timeout ...) may have set exitCode=1 before this attempt
+			// succeeded. The run is good now — don't let the orchestrator discard the reviews as "failed".
+			process.exitCode = 0;
 			return;
 
 		} catch (error) {
 			lastError = error;
 			const message = String(error?.message || error || '');
-			const retryable = /blocked|captcha|challenge|verifying|access denied|forbidden|unusual|temporarily unavailable|cloudflare|robot/i.test(message);
+			const retryable = /blocked|captcha|challenge|verifying|access denied|forbidden|unusual|temporarily unavailable|cloudflare|robot|waiting failed|failed to load|timeout|timed out|exceeded|net::|ERR_|detached frame|target closed|protocol error/i.test(message);
 
 			if (retryable && attempt < maxProxyAttempts) {
 				console.warn(`\n[proxy] ${message}; retrying with next IP (${attempt}/${maxProxyAttempts})...`);

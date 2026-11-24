@@ -200,9 +200,30 @@ function cleanQuoteTitle(value) {
   return t.replace(/^['"“”‘’]+|['"“”‘’]+$/g, '').trim() || null;
 }
 
+const MONTHS_SHORT = ['jan', 'feb', 'mar', 'apr', 'may', 'jun', 'jul', 'aug', 'sep', 'oct', 'nov', 'dec'];
+
+// "Sep 23, 2025" / "September 23, 2025" / "23 Sep 2025" → "2025-09-23" without any timezone shift.
+// (new Date("Sep 23, 2025") is local-midnight, so toISOString() moves it a day back in UTC+ zones.)
+function parseWrittenDate(v) {
+  const s = String(v).replace(/^posted on\s*/i, '').replace(/\./g, '').replace(/\s+/g, ' ').trim();
+  let m = s.match(/^([A-Za-z]{3,9}) (\d{1,2}),? (\d{4})$/);
+  let mon, day, year;
+  if (m) { mon = m[1]; day = m[2]; year = m[3]; }
+  else if ((m = s.match(/^(\d{1,2}) ([A-Za-z]{3,9}),? (\d{4})$/))) { day = m[1]; mon = m[2]; year = m[3]; }
+  else return null;
+  const mi = MONTHS_SHORT.indexOf(mon.slice(0, 3).toLowerCase());
+  if (mi < 0) return null;
+  const d = new Date(Date.UTC(Number(year), mi, Number(day)));
+  return Number.isNaN(d.getTime()) ? null : d.toISOString().slice(0, 10);
+}
+
 function toDateOnly(...values) {
   for (const v of values) {
     if (!v) continue;
+    if (typeof v === 'string') {
+      const written = parseWrittenDate(v);
+      if (written) return written;
+    }
     const d = new Date(v);
     if (!Number.isNaN(d.getTime())) return d.toISOString().slice(0, 10);
   }
@@ -561,10 +582,16 @@ async function countPlatformReviews(companyId, platform) {
   return Number(q.rows[0]?.count) || 0;
 }
 
-function decideReplaceExisting({ storedKey, newKey, existingCount, hasNewReviews, allowUnknownReplace }) {
+function decideReplaceExisting({ storedKey, newKey, existingCount, hasNewReviews, allowUnknownReplace, scrapedCount = 0, complete = true }) {
   if (!newKey || !hasNewReviews) return { replace: false, reason: null };
   if (storedKey && storedKey !== newKey) return { replace: true, reason: 'source_changed' };
-  if (!storedKey && existingCount > 0 && allowUnknownReplace) return { replace: true, reason: 'source_unknown' };
+  if (!storedKey && existingCount > 0 && allowUnknownReplace) {
+    // Replacing = "delete every stored review for this platform, then insert the scraped ones".
+    // Never trade a bigger stored set for a smaller, incomplete scrape (Google's anonymous "limited view"
+    // returns 5 reviews, blocked/partial runs, ...) — that silently wipes the company's reviews.
+    if (!complete && scrapedCount < existingCount) return { replace: false, reason: 'protected_incomplete_scrape' };
+    return { replace: true, reason: 'source_unknown' };
+  }
   return { replace: false, reason: null };
 }
 
@@ -795,14 +822,10 @@ async function main() {
     let companyHadFailure = false;
     let companySavedAnyReviews = false;
 
-    if (!args.dryRun) {
-      try {
-        await resetCompanyRatingSummary(c.id);
-      } catch (e) {
-        companyHadFailure = true;
-        console.error(`WARN: failed to reset rating summary for company_id=${c.id}: ${e.message}`);
-      }
-    }
+    // NOTE: the company's rating/reviews_count is intentionally NOT reset up-front any more.
+    // It used to be zeroed before scraping and only restored if this run saved ≥1 review, so any
+    // failed/blocked/empty scrape left a company with stored reviews but rating=null & reviews_count=0
+    // (looks like "reviews stopped"). The summary is recomputed from the `reviews` table after the run.
 
     for (const job of companyJobs) {
       const { platform, cfg, url } = job;
@@ -825,6 +848,9 @@ async function main() {
 
         const scrapedCount = Array.isArray(payload?.reviews) ? payload.reviews.length : 0;
         console.log(`Scraped ${scrapedCount} reviews (${platform})`);
+        if (payload?.done === false && payload?.reason) {
+          console.warn(`⚠️  ${platform}: incomplete scrape — reason=${payload.reason}`);
+        }
 
         const sourceInfo = buildSourceInfo(platform, url, payload);
         const storedSource = platformSourceEnabled
@@ -839,7 +865,16 @@ async function main() {
           existingCount,
           hasNewReviews,
           allowUnknownReplace,
+          scrapedCount,
+          complete: payload?.done === true,
         });
+
+        if (replaceDecision.reason === 'protected_incomplete_scrape') {
+          console.warn(
+            `🛡️  Keeping ${existingCount} existing ${platform} reviews: this scrape was incomplete ` +
+            `(${scrapedCount} reviews, done=${payload?.done === true}) so it must not replace them.`
+          );
+        }
 
         if (replaceDecision.replace) {
           console.log(
@@ -886,8 +921,8 @@ async function main() {
     }
 
     // Final authoritative recompute after all platforms for this company.
-    // Keep rating/reviews_count null if this run did not save any reviews.
-    if (!args.dryRun && companySavedAnyReviews) {
+    // Always recompute from what is actually stored (also when the scrape failed or found nothing new).
+    if (!args.dryRun) {
       try {
         await updateCompanyRatingSummary(c.id, { stage: 'final' });
       } catch (e) {
